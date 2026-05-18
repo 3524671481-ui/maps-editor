@@ -1,0 +1,822 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>极清网格拼合地图生成器 (支持矢量水系)</title>
+    
+    <!-- 引入 Tailwind CSS 框架 -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- 引入 Leaflet 地图核心库 -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    
+    <!-- 引入 OSM 转 GeoJSON 工具 (水系提取) -->
+    <script src="https://unpkg.com/osmtogeojson@3.0.0-beta.5/osmtogeojson.js"></script>
+    
+    <!-- 引入高精度截图库 -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+
+    <style>
+        .leaflet-control-attribution { display: none !important; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #1f2937; }
+        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+        
+        #toast-container {
+            position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
+            z-index: 99999; display: flex; flex-direction: column; gap: 10px;
+        }
+        .toast {
+            background-color: rgba(17, 24, 39, 0.95); color: white;
+            padding: 12px 24px; border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5); opacity: 0; transition: opacity 0.3s ease;
+            display: flex; align-items: center; gap: 8px;
+        }
+
+        .tang-tooltip {
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+            color: white;
+            font-weight: 700;
+            font-family: 'SimSun', 'Microsoft YaHei', sans-serif;
+            text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 0px 2px 4px rgba(0,0,0,0.8);
+            margin-left: 5px;
+        }
+        
+        .custom-tang-marker { background: transparent; border: none; }
+        
+        /* 离屏高分渲染容器 (用于网格后台切片加载，确保不透明，由遮罩层盖住) */
+        #offscreen-map-container {
+            position: absolute; top: 0; left: 0; z-index: 9000; visibility: hidden; opacity: 1;
+        }
+    </style>
+</head>
+<body class="flex h-screen w-full bg-gray-900 text-gray-100 overflow-hidden font-sans">
+
+    <!-- 全局提示框 -->
+    <div id="toast-container"></div>
+    
+    <!-- 隐形后台渲染容器 -->
+    <div id="offscreen-map-container"></div>
+
+    <!-- 极清渲染沉浸式遮罩 -->
+    <div id="export-overlay" class="fixed inset-0 bg-gray-900 z-[9999] flex flex-col items-center justify-center hidden">
+        <svg class="animate-spin h-16 w-16 text-yellow-500 mb-6" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
+        <div class="text-white text-3xl font-bold tracking-widest mb-3">极清网格拼合引擎运行中</div>
+        <div id="export-progress" class="text-yellow-400 text-xl font-light">正在初始化地图引擎...</div>
+        <div class="text-gray-500 text-sm mt-8">已增加网络延时容错，确保不会出现灰色空白块，请勿切换页面</div>
+    </div>
+
+    <!-- 左侧控制面板 -->
+    <div class="w-80 h-full bg-gray-800 shadow-2xl flex flex-col z-10 relative">
+        <div class="p-5 border-b border-gray-700">
+            <h1 class="text-xl font-bold tracking-wider text-yellow-400">🗺️ 极限画质拼合引擎</h1>
+            <p class="text-xs text-gray-400 mt-2">支持矢量水系双分离导出</p>
+        </div>
+
+        <div class="flex-1 overflow-y-auto p-5 space-y-6">
+            
+            <!-- 模块1：专题加载 -->
+            <div class="space-y-3 bg-gray-750 p-3 rounded bg-gray-700">
+                <h2 class="text-sm font-semibold text-gray-200 border-l-4 border-red-500 pl-2">1. 数据与样式调节</h2>
+                
+                <button onclick="loadTangTombs()" class="w-full bg-red-700 hover:bg-red-600 text-white py-2 rounded text-sm transition-colors shadow">
+                    载入“唐代壁画墓分布”
+                </button>
+                
+                <div class="flex gap-3 text-xs text-gray-400 mt-2 justify-center">
+                    <span class="flex items-center gap-1"><span class="w-3 h-3 bg-[#b91c1c] rounded-full border border-gray-300"></span> 帝陵</span>
+                    <span class="flex items-center gap-1"><span class="w-3 h-3 bg-[#6b7280] rounded-full border border-gray-300"></span> 陪葬墓</span>
+                    <span class="flex items-center gap-1"><span class="w-3 h-3 bg-[#d97706] rounded-full border border-gray-300"></span> 新发掘</span>
+                </div>
+
+                <div class="pt-2 space-y-3">
+                    <label class="flex items-center gap-2 cursor-pointer">
+                        <input type="checkbox" id="labelToggle" class="form-checkbox text-red-500 rounded" checked onchange="loadTangTombs()">
+                        <span class="text-xs text-gray-300">显示外部名称标签</span>
+                    </label>
+                    <div class="flex items-center gap-2">
+                        <span class="text-xs text-gray-400 w-16">点大小:</span>
+                        <input type="range" id="markerSizeSlider" min="10" max="40" value="20" class="flex-1" oninput="loadTangTombs()">
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <span class="text-xs text-gray-400 w-16">名字号:</span>
+                        <input type="range" id="fontSizeSlider" min="10" max="40" value="14" class="flex-1" oninput="loadTangTombs()">
+                    </div>
+                </div>
+            </div>
+
+            <!-- 模块2：搜索 -->
+            <div class="space-y-3 bg-gray-750 p-3 rounded bg-gray-700">
+                <h2 class="text-sm font-semibold text-gray-200 border-l-4 border-blue-500 pl-2">2. 添加自定义地点 (手动/AI)</h2>
+                <div class="flex gap-2">
+                    <input type="text" id="searchInput" placeholder="手动搜索地点名称..." class="flex-1 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-white">
+                    <button onclick="searchLocation()" class="bg-blue-600 hover:bg-blue-500 px-3 py-1 text-sm rounded">定位</button>
+                </div>
+                <!-- AI 解析功能 -->
+                <div class="mt-3 border-t border-gray-600 pt-3">
+                    <p class="text-xs text-purple-400 mb-2 flex items-center gap-1">✨ AI 智能解析 (可粘贴文献段落)</p>
+                    <textarea id="aiInput" rows="2" placeholder="例如：最新发掘的薛柔顺壁画墓位于西安市新城区幸福林带东侧..." class="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-white focus:outline-none focus:border-purple-500 resize-none"></textarea>
+                    <button onclick="parseTextWithAI()" id="btn-ai" class="w-full mt-2 bg-purple-600 hover:bg-purple-500 text-white px-3 py-1 text-sm rounded transition-colors flex justify-center items-center gap-2">
+                        AI 分析并自动标点
+                    </button>
+                </div>
+                <div id="markers-list" class="text-xs text-gray-400 mt-2 space-y-1 max-h-32 overflow-y-auto"></div>
+            </div>
+
+            <!-- 模块3：底图水系 -->
+            <div class="space-y-3">
+                <h2 class="text-sm font-semibold text-gray-300 border-l-4 border-purple-500 pl-2">3. 地貌与水系 (矢量化)</h2>
+                <label class="flex items-center gap-2 cursor-pointer bg-gray-700 p-2 rounded">
+                    <input type="checkbox" id="grayscaleToggle" class="form-checkbox text-purple-600 rounded" checked onchange="toggleGrayscale()">
+                    <span class="text-sm">开启深邃黑白底图处理</span>
+                </label>
+                
+                <div class="flex gap-2 items-center bg-gray-700 p-2 rounded">
+                    <input type="color" id="waterColor" value="#3b82f6" class="w-8 h-8 rounded cursor-pointer bg-transparent border-0" onchange="updateWaterStyle()">
+                    <input type="range" id="waterWeight" min="1" max="10" value="3" class="w-16 cursor-pointer" onchange="updateWaterStyle()">
+                    <button onclick="loadWaterSystems()" id="btn-water" class="flex-1 bg-teal-600 hover:bg-teal-500 rounded text-sm py-1">提取视口水系</button>
+                </div>
+                <p class="text-[10px] text-gray-400 mt-1 pl-1">注：提取的水系将在导出时转化为真正的 SVG 矢量路径</p>
+            </div>
+
+            <!-- 模块4：核心拼合引擎 -->
+            <div class="space-y-3">
+                <h2 class="text-sm font-semibold text-gray-300 border-l-4 border-yellow-500 pl-2">4. 极清网格拼合引擎 (独家)</h2>
+                <div class="bg-yellow-900 bg-opacity-20 p-3 rounded border border-yellow-800 space-y-2">
+                    <p class="text-xs text-yellow-500 leading-tight">
+                        自动切分框选区域，依次放大加载真实高分切片，并无缝拼合。
+                    </p>
+                    <select id="stitchZoom" class="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm focus:outline-none text-white">
+                        <option value="1">下潜放大1级 (约切分4~6块)</option>
+                        <option value="2" selected>下潜放大2级 (约切分12~20块，推荐)</option>
+                        <option value="3">下潜放大3级 (极耗时，做巨幅展板用)</option>
+                    </select>
+                </div>
+                <input type="text" id="mapTitle" placeholder="地图主标题 (SVG矢量导出)" class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm text-white">
+                
+                <!-- 新增：生成图例选项 -->
+                <label class="flex items-center gap-2 cursor-pointer bg-gray-700 p-2 rounded mt-2 border border-gray-600">
+                    <input type="checkbox" id="legendToggle" class="form-checkbox text-yellow-500 rounded bg-gray-800 border-gray-600" checked>
+                    <span class="text-sm text-gray-300">在图纸右下角自动生成图例说明</span>
+                </label>
+
+                <label class="flex items-center gap-2 cursor-pointer bg-yellow-900 bg-opacity-30 p-2 rounded border border-yellow-700 mt-2">
+                    <input type="checkbox" id="cropToggle" class="form-checkbox text-yellow-500 rounded border-gray-600 bg-gray-800" onchange="toggleCropMode()">
+                    <span class="text-sm text-yellow-100 font-semibold animate-pulse">必须开启并画出裁剪区域！</span>
+                </label>
+            </div>
+        </div>
+
+        <div class="p-5 border-t border-gray-700">
+            <button onclick="exportStitchedMap()" id="btn-export" class="w-full bg-orange-600 hover:bg-orange-500 text-white py-3 rounded font-bold transition-colors shadow-lg flex flex-col items-center">
+                <span>🚀 极清：自动网格拼合下载</span>
+                <span class="text-xs font-normal opacity-80">(导出极清底图JPG + 矢量标注水系SVG)</span>
+            </button>
+        </div>
+    </div>
+
+    <!-- 右侧展示区 -->
+    <div id="map-container" class="flex-1 relative bg-[#0a0a0a]">
+        <div id="map" class="w-full h-full bg-transparent"></div>
+    </div>
+
+    <script>
+        // ================= 1. 初始化地图系统 =================
+        const map = L.map('map', { center: [34.55, 108.90], zoom: 10, zoomControl: false });
+        L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+        const satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+            maxZoom: 19, crossOrigin: 'anonymous'
+        }).addTo(map);
+
+        let tangMarkersLayer = L.layerGroup().addTo(map);
+        let waterGeoJSONData = null;
+        let waterLayer = null;
+        
+        let customMarkers = [];
+        let cropMode = false;
+        let cropRect = null;
+        let cropStartLatLng = null;
+        let cropBounds = null;
+
+        // 根据文献及资料最新校对的数据
+        const tangTombsData = [
+            // 帝陵 (红底 1-18)
+            { type: 'ling', id: 1, name: '乾陵', coords: [34.573, 108.219] },
+            { type: 'ling', id: 2, name: '靖陵', coords: [34.566, 108.271] },
+            { type: 'ling', id: 3, name: '建陵', coords: [34.606, 108.406] },
+            { type: 'ling', id: 4, name: '昭陵', coords: [34.612, 108.479] },
+            { type: 'ling', id: 5, name: '贞陵', coords: [34.646, 108.572] },
+            { type: 'ling', id: 6, name: '崇陵', coords: [34.643, 108.681] },
+            { type: 'ling', id: 7, name: '庄陵', coords: [34.631, 108.868] },
+            { type: 'ling', id: 8, name: '端陵', coords: [34.629, 108.961] },
+            { type: 'ling', id: 9, name: '献陵', coords: [34.636, 109.117] },
+            { type: 'ling', id: 10, name: '简陵', coords: [34.721, 108.976] },
+            { type: 'ling', id: 11, name: '元陵', coords: [34.717, 108.995] },
+            { type: 'ling', id: 12, name: '章陵', coords: [34.743, 108.991] },
+            { type: 'ling', id: 13, name: '定陵', coords: [34.744, 109.022] },
+            { type: 'ling', id: 14, name: '丰陵', coords: [34.759, 109.135] },
+            { type: 'ling', id: 15, name: '桥陵', coords: [34.904, 109.475] },
+            { type: 'ling', id: 16, name: '景陵', coords: [34.918, 109.525] },
+            { type: 'ling', id: 17, name: '光陵', coords: [34.939, 109.578] },
+            { type: 'ling', id: 18, name: '泰陵', coords: [34.945, 109.638] },
+
+            // 陪葬墓 (灰底 1-32)
+            { type: 'mu', id: 1, name: '元师奖墓', coords: [34.380, 107.150] },
+            { type: 'mu', id: 2, name: '懿德太子墓', coords: [34.551, 108.232] },
+            { type: 'mu', id: 3, name: '永泰公主墓', coords: [34.548, 108.261] },
+            { type: 'mu', id: 4, name: '章怀太子墓', coords: [34.542, 108.245] },
+            { type: 'mu', id: 5, name: '长乐公主墓', coords: [34.595, 108.481] },
+            { type: 'mu', id: 6, name: '新城长公主墓', coords: [34.591, 108.495] },
+            { type: 'mu', id: 7, name: '安元寿墓', coords: [34.582, 108.475] },
+            { type: 'mu', id: 8, name: '郑仁泰墓', coords: [34.585, 108.492] },
+            { type: 'mu', id: 9, name: '阿史那忠墓', coords: [34.575, 108.505] },
+            { type: 'mu', id: 10, name: '张仲晖墓', coords: [34.390, 108.710] },
+            { type: 'mu', id: 11, name: '贺若氏墓', coords: [34.360, 108.750] },
+            { type: 'mu', id: 12, name: '万泉县主墓', coords: [34.380, 108.720] },
+            { type: 'mu', id: 13, name: '张去奢墓', coords: [34.370, 108.740] },
+            { type: 'mu', id: 14, name: '李晖墓', coords: [34.440, 108.980] },
+            { type: 'mu', id: 15, name: '杨玄略墓', coords: [34.250, 108.850] },
+            { type: 'mu', id: 16, name: '梁元翰墓', coords: [34.250, 109.050] },
+            { type: 'mu', id: 17, name: '执失奉节墓', coords: [34.180, 108.900] },
+            { type: 'mu', id: 18, name: '韦君夫人墓', coords: [34.150, 108.950] },
+            { type: 'mu', id: 19, name: '韦洞墓', coords: [34.130, 108.960] },
+            { type: 'mu', id: 20, name: '苏思勖墓', coords: [34.220, 109.020] },
+            { type: 'mu', id: 21, name: '薛莫墓', coords: [34.230, 109.000] },
+            { type: 'mu', id: 22, name: '李爽墓', coords: [34.180, 108.960] },
+            { type: 'mu', id: 23, name: '司马睿墓', coords: [34.280, 109.050] },
+            { type: 'mu', id: 24, name: '金乡县主墓', coords: [34.270, 109.110] },
+            { type: 'mu', id: 25, name: '李寿墓', coords: [34.600, 108.900] },
+            { type: 'mu', id: 26, name: '房陵大长公主墓', coords: [34.630, 109.110] },
+            { type: 'mu', id: 27, name: '李凤墓', coords: [34.640, 109.120] },
+            { type: 'mu', id: 28, name: '节愍太子墓', coords: [34.730, 109.030] },
+            { type: 'mu', id: 29, name: '惠庄太子墓', coords: [34.880, 109.460] },
+            { type: 'mu', id: 30, name: '让皇帝惠陵', coords: [34.890, 109.480] },
+            { type: 'mu', id: 31, name: '贞顺皇后敬陵', coords: [34.100, 109.150] },
+            { type: 'mu', id: 32, name: '韩休墓', coords: [34.150, 109.050] },
+
+            // 新发掘或修复唐壁画墓 (橙金底 1-6)
+            { type: 'new', id: 1, name: '杨知什庞大家墓', coords: [34.430, 108.760] },
+            { type: 'new', id: 2, name: '薛柔顺墓', coords: [34.275, 109.025] },
+            { type: 'new', id: 3, name: '白杨寨M1373', coords: [34.305, 109.045] },
+            { type: 'new', id: 4, name: '韦君墓', coords: [34.140, 108.900] },
+            { type: 'new', id: 5, name: '石刘村M318', coords: [34.480, 108.820] },
+            { type: 'new', id: 6, name: '李道坚墓', coords: [34.740, 109.170] }
+        ];
+
+        window.toggleGrayscale = function() {
+            const isChecked = document.getElementById('grayscaleToggle').checked;
+            satelliteLayer.getContainer().style.filter = isChecked ? "grayscale(100%) contrast(1.2) brightness(0.6)" : "none";
+        }
+        toggleGrayscale();
+
+        window.loadTangTombs = function() {
+            tangMarkersLayer.clearLayers();
+            const showLabels = document.getElementById('labelToggle').checked;
+            const baseMarkerSize = parseInt(document.getElementById('markerSizeSlider').value);
+            const labelFontSize = parseInt(document.getElementById('fontSizeSlider').value);
+            
+            tangTombsData.forEach(site => {
+                const isLing = site.type === 'ling';
+                const isNew = site.type === 'new';
+                const fillColor = isLing ? '#b91c1c' : (isNew ? '#d97706' : '#6b7280');
+                const size = isLing ? baseMarkerSize * 1.3 : baseMarkerSize; 
+                const numFontSize = size * 0.45; 
+
+                const svgIconString = `
+                    <svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg">
+                        <circle cx="${size/2}" cy="${size/2}" r="${size/2 - 1.5}" fill="${fillColor}" stroke="#ffffff" stroke-width="1.5"/>
+                        <text x="${size/2}" y="${size/2 + (numFontSize*0.1)}" font-size="${numFontSize}px" fill="#ffffff" font-family="Arial, sans-serif" font-weight="bold" text-anchor="middle" dominant-baseline="middle">${site.id}</text>
+                    </svg>
+                `;
+
+                const icon = L.divIcon({ className: 'custom-tang-marker', html: svgIconString, iconSize: [size, size] });
+                const marker = L.marker(site.coords, { icon: icon }).addTo(tangMarkersLayer);
+
+                marker.bindTooltip(`<span style="font-size: ${labelFontSize}px;">${site.name}</span>`, {
+                    permanent: showLabels, direction: 'right', className: 'tang-tooltip', offset: [size/2, 0]
+                });
+            });
+
+            if (tangTombsData.length > 0) {
+                const group = new L.featureGroup(tangMarkersLayer.getLayers());
+                map.flyToBounds(group.getBounds(), { padding: [80, 80], maxZoom: 11, duration: 1 });
+            }
+        }
+
+        function showToast(message, duration = 4000) {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            toast.innerHTML = message;
+            container.appendChild(toast);
+            setTimeout(() => { toast.style.opacity = '1'; }, 10);
+            setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => container.removeChild(toast), 300); }, duration);
+        }
+
+        function applyGrayscale(canvas) {
+            try {
+                const ctx = canvas.getContext('2d', { willReadFrequently: true });
+                const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                const data = imgData.data;
+                for (let i = 0; i < data.length; i += 4) {
+                    const luma = data[i]*0.299 + data[i+1]*0.587 + data[i+2]*0.114;
+                    data[i] = data[i+1] = data[i+2] = luma * 0.7; 
+                }
+                ctx.putImageData(imgData, 0, 0);
+            } catch (e) { console.warn("灰度化受限", e); }
+        }
+
+        // ================= 突破性算法：GeoJSON 到 SVG 原生矢量转换 =================
+        function generateWaterSvgPaths(waterData, mapInstance, zoom, nwPoint, scale) {
+            if (!waterData || !waterData.features) return '';
+            
+            const waterColor = document.getElementById('waterColor').value;
+            const waterWeight = parseInt(document.getElementById('waterWeight').value) * scale;
+            
+            let svgStr = `<g id="water-systems" stroke="${waterColor}" stroke-width="${waterWeight}" fill="none" opacity="0.85" stroke-linejoin="round" stroke-linecap="round">\n`;
+
+            const processRing = (ring) => {
+                let d = '';
+                ring.forEach((c, index) => {
+                    const latlng = L.latLng(c[1], c[0]); 
+                    const pt = mapInstance.project(latlng, zoom);
+                    const drawX = pt.x - nwPoint.x;
+                    const drawY = pt.y - nwPoint.y;
+                    d += (index === 0 ? 'M' : 'L') + `${drawX},${drawY} `;
+                });
+                return d;
+            };
+
+            waterData.features.forEach(feature => {
+                const geom = feature.geometry;
+                if (!geom) return;
+                const type = geom.type;
+                const coords = geom.coordinates;
+                
+                let dString = '';
+                if (type === 'LineString') {
+                    dString = processRing(coords);
+                } else if (type === 'MultiLineString' || type === 'Polygon') {
+                    coords.forEach(ring => {
+                        dString += processRing(ring);
+                        if (type === 'Polygon') dString += 'Z ';
+                    });
+                } else if (type === 'MultiPolygon') {
+                    coords.forEach(poly => {
+                        poly.forEach(ring => {
+                            dString += processRing(ring);
+                            dString += 'Z ';
+                        });
+                    });
+                }
+                
+                if (dString) {
+                    const fillAttr = (type === 'Polygon' || type === 'MultiPolygon') ? `fill="${waterColor}" fill-opacity="0.4"` : 'fill="none"';
+                    svgStr += `  <path d="${dString}" ${fillAttr}/>\n`;
+                }
+            });
+
+            svgStr += `</g>\n`;
+            return svgStr;
+        }
+
+
+        // ================= 极清网格拼合引擎 =================
+        async function exportStitchedMap() {
+            if (!cropMode || !cropBounds) {
+                showToast("⚠️ 操作错误：网格拼合引擎必须先在底图上开启并【画出黄色的框选范围】！", 4000);
+                return;
+            }
+
+            const btn = document.getElementById('btn-export');
+            btn.disabled = true;
+
+            const extraZoom = parseInt(document.getElementById('stitchZoom').value); 
+            const targetZoom = map.getZoom() + extraZoom;
+            const scale = Math.pow(2, extraZoom);
+
+            const nwPoint = map.project(cropBounds.getNorthWest(), targetZoom);
+            const sePoint = map.project(cropBounds.getSouthEast(), targetZoom);
+            
+            const totalW = Math.round(sePoint.x - nwPoint.x);
+            const totalH = Math.round(sePoint.y - nwPoint.y);
+
+            if (totalW * totalH > 16000 * 16000) {
+                showToast(`❌ 画幅过大警告：即将生成的图像达到了 ${totalW} x ${totalH} 像素。浏览器内存可能会崩溃，请缩小框选范围或降低下潜等级。`);
+                btn.disabled = false;
+                return;
+            }
+
+            const masterCanvas = document.createElement('canvas');
+            masterCanvas.width = totalW;
+            masterCanvas.height = totalH;
+            const ctx = masterCanvas.getContext('2d');
+            ctx.fillStyle = "#111111"; 
+            ctx.fillRect(0, 0, totalW, totalH);
+
+            const blockSize = 1000;
+            const cols = Math.ceil(totalW / blockSize);
+            const rows = Math.ceil(totalH / blockSize);
+            const totalBlocks = cols * rows;
+
+            const overlay = document.getElementById('export-overlay');
+            const progressText = document.getElementById('export-progress');
+            overlay.classList.remove('hidden');
+            progressText.innerText = `即将切分为 ${rows}行 x ${cols}列 = ${totalBlocks} 块进行拉近扫描...`;
+
+            const hiddenContainer = document.getElementById('offscreen-map-container');
+            hiddenContainer.style.visibility = 'visible';
+            hiddenContainer.style.opacity = '1'; 
+
+            if (window.hiddenMap) { window.hiddenMap.remove(); }
+            window.hiddenMap = L.map('offscreen-map-container', { 
+                zoomControl: false, attributionControl: false, fadeAnimation: false, zoomAnimation: false, boxZoom: false 
+            });
+
+            L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+                maxZoom: 19, crossOrigin: 'anonymous', keepBuffer: 4, updateWhenIdle: false
+            }).addTo(window.hiddenMap);
+
+            let currentBlock = 0;
+            for (let r = 0; r < rows; r++) {
+                for (let c = 0; c < cols; c++) {
+                    currentBlock++;
+                    progressText.innerText = `正在下载并拼合第 ${currentBlock} / ${totalBlocks} 区块...`;
+                    
+                    const blockW = Math.min(blockSize, totalW - c * blockSize);
+                    const blockH = Math.min(blockSize, totalH - r * blockSize);
+                    
+                    hiddenContainer.style.width = blockW + 'px';
+                    hiddenContainer.style.height = blockH + 'px';
+                    window.hiddenMap.invalidateSize(false);
+
+                    const blockNWPoint = L.point(nwPoint.x + c * blockSize, nwPoint.y + r * blockSize);
+                    const blockSEPoint = L.point(blockNWPoint.x + blockW, blockNWPoint.y + blockH);
+                    
+                    const blockNW = window.hiddenMap.unproject(blockNWPoint, targetZoom);
+                    const blockSE = window.hiddenMap.unproject(blockSEPoint, targetZoom);
+                    
+                    window.hiddenMap.fitBounds(L.latLngBounds(blockNW, blockSE), { animate: false });
+                    
+                    await new Promise(res => setTimeout(res, 3500)); 
+                    
+                    try {
+                        const blockCanvas = await html2canvas(hiddenContainer, { 
+                            useCORS: true, allowTaint: false, logging: false, scale: 1, backgroundColor: '#111111'
+                        });
+                        ctx.drawImage(blockCanvas, c * blockSize, r * blockSize);
+                    } catch(e) {
+                        console.warn(`切片 (${c},${r}) 拼合出现瑕疵`, e);
+                    }
+                }
+            }
+
+            progressText.innerText = "全部切片获取完成！正在应用像素级深邃滤镜 (请耐心等待)...";
+            await new Promise(res => setTimeout(res, 300)); 
+            
+            if (document.getElementById('grayscaleToggle').checked) {
+                applyGrayscale(masterCanvas);
+            }
+
+            progressText.innerText = "正在打包生成 AI 双层源文件...";
+            await new Promise(res => setTimeout(res, 200));
+
+            const title = document.getElementById('mapTitle').value.trim();
+            const baseName = title ? title : 'Heritage_Stitched_Map';
+
+            const jpgUrl = masterCanvas.toDataURL('image/jpeg', 0.95);
+            const a1 = document.createElement('a');
+            a1.href = jpgUrl;
+            a1.download = baseName + '_Background_HD.jpg';
+            a1.click();
+
+            const baseMarkerSize = parseInt(document.getElementById('markerSizeSlider').value);
+            const labelFontSize = parseInt(document.getElementById('fontSizeSlider').value);
+            const showLabels = document.getElementById('labelToggle').checked;
+
+            let svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${totalW} ${totalH}" width="${totalW}" height="${totalH}">\n`;
+            
+            if (waterGeoJSONData) {
+                svg += generateWaterSvgPaths(waterGeoJSONData, window.hiddenMap, targetZoom, nwPoint, scale);
+            }
+
+            if (title) {
+                svg += `  <text x="${40 * scale}" y="${60 * scale}" font-family="'SimSun', 'Microsoft YaHei', serif" font-weight="bold" font-size="${32 * scale}px" fill="#ffffff" style="text-shadow: 2px 2px 4px rgba(0,0,0,0.8);">${title}</text>\n`;
+            }
+
+            tangTombsData.forEach(site => {
+                const pt = window.hiddenMap.project(site.coords, targetZoom);
+                const drawX = pt.x - nwPoint.x;
+                const drawY = pt.y - nwPoint.y;
+
+                if (drawX >= -50 && drawX <= totalW + 50 && drawY >= -50 && drawY <= totalH + 50) {
+                    const isLing = site.type === 'ling';
+                    const isNew = site.type === 'new';
+                    const fillColor = isLing ? '#b91c1c' : (isNew ? '#d97706' : '#6b7280');
+                    const size = (isLing ? baseMarkerSize * 1.3 : baseMarkerSize) * scale; 
+                    const radius = size / 2;
+                    const numFontSize = size * 0.45;
+                    const nameFontSize = labelFontSize * scale;
+
+                    svg += `  <g id="tomb-${site.id}">\n`;
+                    svg += `    <circle cx="${drawX}" cy="${drawY}" r="${radius - 1.5 * scale}" fill="${fillColor}" stroke="#ffffff" stroke-width="${1.5 * scale}"/>\n`;
+                    svg += `    <text x="${drawX}" y="${drawY + (numFontSize*0.1)}" font-family="Arial, sans-serif" font-weight="bold" font-size="${numFontSize}px" fill="#ffffff" text-anchor="middle" dominant-baseline="middle">${site.id}</text>\n`;
+                    
+                    if (showLabels) {
+                        svg += `    <text x="${drawX + radius + (5 * scale)}" y="${drawY + (nameFontSize*0.1)}" font-family="'SimSun', 'Microsoft YaHei', sans-serif" font-weight="bold" font-size="${nameFontSize}px" fill="#ffffff" dominant-baseline="middle" style="text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 0px 2px 4px rgba(0,0,0,0.8);">${site.name}</text>\n`;
+                    }
+                    svg += `  </g>\n`;
+                }
+            });
+
+            customMarkers.forEach(m => {
+                const pt = window.hiddenMap.project([m.lat, m.lon], targetZoom);
+                const drawX = pt.x - nwPoint.x;
+                const drawY = pt.y - nwPoint.y;
+
+                if (drawX >= -50 && drawX <= totalW + 50 && drawY >= -50 && drawY <= totalH + 50) {
+                    const nameFontSize = labelFontSize * scale;
+                    const pinColor = m.color || "#ef4444";
+                    svg += `  <g id="custom-${m.name}">\n`;
+                    svg += `    <path d="M${drawX},${drawY} C${drawX-12*scale},${drawY-24*scale} ${drawX-12*scale},${drawY-36*scale} ${drawX},${drawY-36*scale} C${drawX+12*scale},${drawY-36*scale} ${drawX+12*scale},${drawY-24*scale} ${drawX},${drawY} Z" fill="${pinColor}" stroke="#ffffff" stroke-width="${2*scale}"/>\n`;
+                    if (showLabels) {
+                        svg += `    <text x="${drawX + 15 * scale}" y="${drawY - 18 * scale}" font-family="'SimSun', 'Microsoft YaHei', sans-serif" font-weight="bold" font-size="${nameFontSize}px" fill="#ffffff" dominant-baseline="middle" style="text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 0px 2px 4px rgba(0,0,0,0.8);">${m.name}</text>\n`;
+                    }
+                    svg += `  </g>\n`;
+                }
+            });
+
+            // --- 新增功能：自动生成右下角精致图例 ---
+            if (document.getElementById('legendToggle').checked) {
+                const legendW = 380 * scale; // 图例宽度
+                const legendH = 160 * scale; // 图例高度
+                const padX = 50 * scale;     // 距离右侧边缘的边距
+                const padY = 50 * scale;     // 距离底部边缘的边距
+                const startX = totalW - legendW - padX;
+                const startY = totalH - legendH - padY;
+                const fontSize = 15 * scale;
+                const iconR = 8 * scale;
+                
+                svg += `  <!-- 图例模块 (Legend) -->\n`;
+                svg += `  <g id="map-legend" transform="translate(${startX}, ${startY})">\n`;
+                
+                // 绘制深色磨砂背景框
+                svg += `    <rect x="0" y="0" width="${legendW}" height="${legendH}" fill="#0f0f0f" fill-opacity="0.8" stroke="#4b5563" stroke-width="${1.5*scale}" stroke-opacity="0.8" rx="${6*scale}"/>\n`;
+                
+                // 绘制主标题与分隔线
+                svg += `    <text x="${25*scale}" y="${38*scale}" font-family="'SimSun', 'Microsoft YaHei', sans-serif" font-weight="bold" font-size="${18*scale}px" fill="#fbbf24" style="letter-spacing: ${3*scale}px;">图例说明</text>\n`;
+                svg += `    <line x1="${25*scale}" y1="${52*scale}" x2="${legendW - 25*scale}" y2="${52*scale}" stroke="#4b5563" stroke-opacity="0.8" stroke-width="${1*scale}"/>\n`;
+
+                // 左侧列：帝陵、陪葬墓、新发掘
+                let itemY = 82 * scale;
+                svg += `    <circle cx="${35*scale}" cy="${itemY - fontSize*0.3}" r="${iconR}" fill="#b91c1c" stroke="#fff" stroke-width="${1.5*scale}"/>\n`;
+                svg += `    <text x="${55*scale}" y="${itemY}" font-family="'Microsoft YaHei', sans-serif" font-size="${fontSize}px" fill="#e5e7eb">唐代帝陵</text>\n`;
+
+                itemY += 32 * scale;
+                svg += `    <circle cx="${35*scale}" cy="${itemY - fontSize*0.3}" r="${iconR}" fill="#6b7280" stroke="#fff" stroke-width="${1.5*scale}"/>\n`;
+                svg += `    <text x="${55*scale}" y="${itemY}" font-family="'Microsoft YaHei', sans-serif" font-size="${fontSize}px" fill="#e5e7eb">重要壁画陪葬墓</text>\n`;
+
+                itemY += 32 * scale;
+                svg += `    <circle cx="${35*scale}" cy="${itemY - fontSize*0.3}" r="${iconR}" fill="#d97706" stroke="#fff" stroke-width="${1.5*scale}"/>\n`;
+                svg += `    <text x="${55*scale}" y="${itemY}" font-family="'Microsoft YaHei', sans-serif" font-size="${fontSize}px" fill="#e5e7eb">新发掘/修复壁画墓</text>\n`;
+
+                // 右侧列：自然水系、AI/检索标点
+                itemY = 82 * scale;
+                let rightX = 220 * scale; // 右列起始X坐标
+                
+                const waterColor = document.getElementById('waterColor').value;
+                svg += `    <line x1="${rightX}" y1="${itemY - fontSize*0.3}" x2="${rightX + 24*scale}" y2="${itemY - fontSize*0.3}" stroke="${waterColor}" stroke-width="${4*scale}" stroke-linecap="round"/>\n`;
+                svg += `    <text x="${rightX + 38*scale}" y="${itemY}" font-family="'Microsoft YaHei', sans-serif" font-size="${fontSize}px" fill="#e5e7eb">自然水系</text>\n`;
+
+                itemY += 32 * scale;
+                svg += `    <path d="M${rightX + 12*scale},${itemY - fontSize*0.3 + 4*scale} C${rightX + 12*scale - 8*scale},${itemY - fontSize*0.3 - 10*scale} ${rightX + 12*scale - 8*scale},${itemY - fontSize*0.3 - 16*scale} ${rightX + 12*scale},${itemY - fontSize*0.3 - 16*scale} C${rightX + 12*scale + 8*scale},${itemY - fontSize*0.3 - 16*scale} ${rightX + 12*scale + 8*scale},${itemY - fontSize*0.3 - 10*scale} ${rightX + 12*scale},${itemY - fontSize*0.3 + 4*scale} Z" fill="#9333ea" stroke="#ffffff" stroke-width="${1.5*scale}"/>\n`;
+                svg += `    <text x="${rightX + 38*scale}" y="${itemY}" font-family="'Microsoft YaHei', sans-serif" font-size="${fontSize}px" fill="#e5e7eb">AI/自定义标点</text>\n`;
+
+                svg += `  </g>\n`;
+            }
+
+            svg += `</svg>`;
+
+            const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a2 = document.createElement('a');
+            a2.href = url;
+            a2.download = baseName + '_Vectors_HD.svg';
+            document.body.appendChild(a2);
+            a2.click();
+            document.body.removeChild(a2);
+            URL.revokeObjectURL(url);
+
+            showToast("✅ 完美收工！原生极致高清 JPG 与 矢量 SVG (含水系) 均已下载完成。");
+            
+            hiddenContainer.style.visibility = 'hidden';
+            overlay.classList.add('hidden');
+            btn.disabled = false;
+        }
+
+        // ================= 常规互动逻辑与 AI 解析 =================
+        function addCustomMarker(lat, lon, name, color = '#ef4444') {
+            const customIcon = L.divIcon({ 
+                className: 'custom-pin-container', 
+                html: `<div style="position:relative; top:-24px; left:-12px; width:24px; height:24px; background-color:${color}; border:2px solid white; border-radius:50% 50% 50% 0; transform:rotate(-45deg); box-shadow: 2px 2px 4px rgba(0,0,0,0.5);"></div>`, 
+                iconSize: [0, 0] 
+            });
+            const marker = L.marker([lat, lon], { icon: customIcon }).addTo(map);
+            
+            const labelFontSize = parseInt(document.getElementById('fontSizeSlider').value) || 14;
+            const showLabels = document.getElementById('labelToggle').checked;
+            marker.bindTooltip(`<span style="font-size: ${labelFontSize}px;">${name}</span>`, {
+                permanent: showLabels, direction: 'right', className: 'tang-tooltip', offset: [10, -12]
+            });
+            
+            customMarkers.push({ name, lat, lon, marker, color });
+            updateMarkersList();
+        }
+
+        async function searchLocation() {
+            const query = document.getElementById('searchInput').value.trim();
+            if (!query) return;
+            showToast("正在手动搜索...");
+            const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=1`;
+            try {
+                const response = await fetch(url, { headers: { 'Accept-Language': 'zh-CN,zh;q=0.9' } });
+                const data = await response.json();
+                if (data.length > 0) {
+                    const lat = parseFloat(data[0].lat); const lon = parseFloat(data[0].lon);
+                    const name = data[0].display_name.split(',')[0];
+                    map.flyTo([lat, lon], 13);
+                    
+                    addCustomMarker(lat, lon, name, '#ef4444');
+                    
+                    document.getElementById('searchInput').value = '';
+                    showToast(`成功定位：${name}`);
+                } else {
+                    showToast("未找到该地点，尝试使用大范围名称搜索。");
+                }
+            } catch (error) { 
+                console.error(error);
+                showToast("搜索请求失败，请检查网络。"); 
+            }
+        }
+
+        async function parseTextWithAI() {
+            const text = document.getElementById('aiInput').value.trim();
+            if (!text) {
+                showToast("请输入需要 AI 分析的文献或文本！");
+                return;
+            }
+
+            const btn = document.getElementById('btn-ai');
+            btn.innerHTML = `<svg class="animate-spin h-4 w-4 text-white inline mr-2" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>AI 联网检索分析中...`;
+            btn.disabled = true;
+            showToast("AI 正在解析文本并联网检索地理坐标，这通常需要十秒钟...");
+
+            const apiKey = "";
+            const payload = {
+                contents: [{
+                    parts: [{ text: `分析以下考古/历史文本，提取出其中提及的墓葬、遗址或其他地标的位置信息。结合你的地理知识以及搜索工具，获取它们的具体经纬度（纬度lat，经度lon，使用WGS84坐标系）。如果无法确定极其精确的坐标，请给出所在村庄或街道的中心坐标。必须返回一个JSON数组，对象包含 name, lat, lon。文本如下：\n${text}` }]
+                }],
+                tools: [{ google_search: {} }],
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    responseSchema: {
+                        type: "ARRAY",
+                        items: {
+                            type: "OBJECT",
+                            properties: {
+                                name: { type: "STRING" },
+                                lat: { type: "NUMBER" },
+                                lon: { type: "NUMBER" }
+                            },
+                            required: ["name", "lat", "lon"]
+                        }
+                    }
+                }
+            };
+
+            try {
+                let responseText = null;
+                let retries = 5;
+                let delays = [1000, 2000, 4000, 8000, 16000];
+                
+                for (let i = 0; i <= retries; i++) {
+                    try {
+                        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        });
+                        if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+                        const result = await res.json();
+                        responseText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                        if (responseText) break;
+                    } catch (err) {
+                        if (i === retries) throw err;
+                        await new Promise(r => setTimeout(r, delays[i]));
+                    }
+                }
+
+                if (responseText) {
+                    const locations = JSON.parse(responseText);
+                    if (locations.length === 0) {
+                        showToast("AI 未能从文本中提取到具备有效坐标的地点。");
+                    } else {
+                        let added = 0;
+                        locations.forEach(loc => {
+                            if (loc.lat && loc.lon) {
+                                addCustomMarker(loc.lat, loc.lon, loc.name, '#9333ea'); // 紫色大头钉代表 AI
+                                added++;
+                            }
+                        });
+                        showToast(`✅ AI 分析完成，成功在地图上标出 ${added} 个地点！`);
+                        if (added > 0) {
+                            map.flyTo([locations[0].lat, locations[0].lon], 11);
+                        }
+                    }
+                } else {
+                    showToast("❌ AI 响应为空，请重试。");
+                }
+            } catch (error) {
+                console.error(error);
+                showToast("❌ AI 解析请求失败，请检查网络或稍后重试。");
+            } finally {
+                btn.innerHTML = `AI 分析并自动标点`;
+                btn.disabled = false;
+                document.getElementById('aiInput').value = '';
+            }
+        }
+
+        function updateMarkersList() {
+            const list = document.getElementById('markers-list');
+            list.innerHTML = '';
+            customMarkers.forEach((m, index) => {
+                const item = document.createElement('div');
+                item.className = "flex justify-between items-center bg-gray-800 px-2 py-1 rounded border border-gray-600";
+                item.innerHTML = `<span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full" style="background-color: ${m.color || '#ef4444'}"></span>${m.name}</span><button onclick="removeMarker(${index})" class="text-red-400 hover:text-red-300">删除</button>`;
+                list.appendChild(item);
+            });
+        }
+
+        window.removeMarker = function(index) {
+            map.removeLayer(customMarkers[index].marker);
+            customMarkers.splice(index, 1);
+            updateMarkersList();
+        }
+
+        window.toggleCropMode = function() {
+            cropMode = document.getElementById('cropToggle').checked;
+            if (cropMode) {
+                map.dragging.disable(); map.getContainer().style.cursor = 'crosshair';
+                map.on('mousedown', startCrop);
+                showToast("已开启框选模式，请在地图上按下并拖拽画出你要切割的范围。");
+            } else {
+                map.dragging.enable(); map.getContainer().style.cursor = '';
+                map.off('mousedown', startCrop);
+                if (cropRect) { map.removeLayer(cropRect); cropRect = null; cropBounds = null; }
+            }
+        }
+
+        function startCrop(e) {
+            if (!cropMode) return;
+            cropStartLatLng = e.latlng;
+            if (cropRect) map.removeLayer(cropRect);
+            cropRect = L.rectangle([cropStartLatLng, cropStartLatLng], { color: "#eab308", weight: 2, dashArray: "5,5", fillOpacity: 0.2, interactive: false }).addTo(map);
+            map.on('mousemove', updateCrop); map.on('mouseup', endCrop);
+        }
+        function updateCrop(e) { if (cropRect && cropStartLatLng) cropRect.setBounds([cropStartLatLng, e.latlng]); }
+        function endCrop(e) { map.off('mousemove', updateCrop); map.off('mouseup', endCrop); if (cropRect) cropBounds = cropRect.getBounds(); }
+
+        async function loadWaterSystems() {
+            if (map.getZoom() < 10) return showToast("当前视口过大，请放大地图后再提取水系。");
+            const btn = document.getElementById('btn-water');
+            btn.innerHTML = `提取中...`; btn.disabled = true;
+            const b = map.getBounds();
+            const query = `[out:json][timeout:25];(way["waterway"](${b.getSouth()},${b.getWest()},${b.getNorth()},${b.getEast()});relation["waterway"](${b.getSouth()},${b.getWest()},${b.getNorth()},${b.getEast()});way["natural"="water"](${b.getSouth()},${b.getWest()},${b.getNorth()},${b.getEast()}););out body;>;out skel qt;`;
+            try {
+                const res = await fetch("https://overpass-api.de/api/interpreter?data=" + encodeURIComponent(query));
+                waterGeoJSONData = osmtogeojson(await res.json());
+                updateWaterStyle();
+                showToast("水系提取成功！将在导出时作为纯矢量SVG生成。");
+            } catch (err) { showToast("请求失败，请稍后再试。"); }
+            btn.innerHTML = `提取视口水系`; btn.disabled = false;
+        }
+
+        window.updateWaterStyle = function() {
+            if (!waterGeoJSONData) return;
+            if (waterLayer) map.removeLayer(waterLayer);
+            const color = document.getElementById('waterColor').value;
+            const weight = document.getElementById('waterWeight').value;
+            waterLayer = L.geoJSON(waterGeoJSONData, {
+                style: () => ({ color: color, weight: parseInt(weight), opacity: 0.85 })
+            }).addTo(map);
+        }
+    </script>
+</body>
+</html>
